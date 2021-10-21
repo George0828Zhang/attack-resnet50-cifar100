@@ -9,17 +9,17 @@ from torch.cuda.amp import GradScaler, autocast
 # general
 import shutil
 import numpy as np
-from qqdm import qqdm as tqdm
 import sys
 import logging
 import argparse
-from torchinfo import summary
 from pathlib import Path
 import os
 import glob
-from PIL import Image
 
 # others
+from PIL import Image
+from torchinfo import summary
+from qqdm import qqdm as tqdm
 from pytorchcv.model_provider import get_model as ptcv_get_model
 from torchattacks import TIFGSM
 
@@ -63,7 +63,18 @@ class AdvDataset(Dataset):
         return len(self.images)
 
 
-class TIFGSM2(TIFGSM):
+class TISGMLinBP(TIFGSM):
+    def __init__(
+        self,
+        *args,
+        linbp_layer="3_1",
+        sgm_lambda=1.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.linbp_layer = linbp_layer
+        self.sgm_lambda = sgm_lambda
+
     def forward(
         self,
         model,
@@ -94,7 +105,7 @@ class TIFGSM2(TIFGSM):
             adv_images.requires_grad = True
             # outputs = self.model(self.input_diversity(adv_images))
             outputs, ori_mask_ls, conv_out_ls, relu_out_ls, conv_input_ls = linbp_forw_resnet50(
-                self.model, self.input_diversity(adv_images), True, linbp_layer="3_4")
+                self.model, self.input_diversity(adv_images), True, self.linbp_layer)
                 
             # Calculate loss
             if self._targeted:
@@ -105,7 +116,7 @@ class TIFGSM2(TIFGSM):
             # Update adversarial images
             # grad = torch.autograd.grad(cost, adv_images,
             #                            retain_graph=False, create_graph=False)[0]
-            grad = linbp_backw_resnet50(adv_images, cost, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=0.5)
+            grad = linbp_backw_resnet50(adv_images, cost, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=self.sgm_lambda)
 
             # depth wise conv2d
             grad = F.conv2d(grad, stacked_kernel, stride=1, padding='same', groups=3)
@@ -204,23 +215,8 @@ class Attacker:
             im = Image.fromarray(example.astype(np.uint8)) # image pixel value should be unsigned int
             im.save(os.path.join(adv_dir, name))
 
-    def try_load_checkpoint(self, model, name=None):
-        name = name if name else "checkpoints/checkpoint_last.pt"
-        checkpath = Path(name)
-        if checkpath.exists():
-            check = torch.load(checkpath)
-            model.load_state_dict(check["model"])
-            stats = check["stats"]
-            logger.info(
-                f"loaded checkpoint {checkpath}: epoch={stats['epoch']} loss={stats['loss']} acc={stats['acc']}")
-        else:
-            logger.info(f"no checkpoints found at {checkpath}!")
-        return model
-
     def solve(self,):
         device = self.device
-        # model = models.resnet.cifar100_resnet56().to(device)
-        # model = self.try_load_checkpoint(model, name=self.args.resume)
         model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar100_resnet56", pretrained=True).to(device)
         victim = ptcv_get_model('densenet100_k24_cifar100', pretrained=True).to(device)
         model.eval()
@@ -231,10 +227,10 @@ class Attacker:
         # benign_acc, benign_loss = self.epoch_benign(model)
         # logger.info(f'source benign_acc = {benign_acc:.5f}, benign_loss = {benign_loss:.5f}')
 
-        cuclear()
+        # cuclear()
 
-        benign_acc, benign_loss = self.epoch_benign(victim)
-        logger.info(f'benign_acc = {benign_acc:.5f}, benign_loss = {benign_loss:.5f}')
+        # benign_acc, benign_loss = self.epoch_benign(victim)
+        # logger.info(f'benign_acc = {benign_acc:.5f}, benign_loss = {benign_loss:.5f}')
 
         def fgsm(model, x, y, loss_fn, epsilon=self.epsilon):
             x_adv = x.detach().clone()
@@ -272,35 +268,35 @@ class Attacker:
             return x_adv
 
         # cuclear()
-        # # 0.56
         # adv_examples, acc, loss = self.gen_adv_examples(model, fgsm, victim)
         # logger.info(f'fgsm_acc = {acc:.5f}, fgsm_loss = {loss:.5f}')
 
         # cuclear()
-        # # 0.828
         # adv_examples, acc, loss = self.gen_adv_examples(model, ifgsm, victim)
         # logger.info(f'ifgsm_acc = {acc:.5f}, ifgsm_loss = {loss:.5f}')
 
         
         # cuclear()
-        # : 0.678
-        # +sgm: 0.634
         # adv_examples, acc, loss = self.gen_adv_examples(model, linbp, victim)
         # logger.info(f'linbp_acc = {acc:.5f}, linbp_loss = {loss:.5f}')
 
-        tifgsm = TIFGSM2(
+        tisgmlinbp = TISGMLinBP(
             model, 
             eps=self.epsilon, 
             alpha=self.alpha, 
             steps=20, 
             decay=0.,
             kernel_name='gaussian',
+            linbp_layer="3_4",
+            sgm_lambda=0.5
         )
 
         cuclear()
         # ti + linbp + sgm
-        adv_examples, acc, loss = self.gen_adv_examples(model, tifgsm, victim)
-        logger.info(f'tifgsm_acc = {acc:.5f}, tifgsm_loss = {loss:.5f}')
+        adv_examples, acc, loss = self.gen_adv_examples(model, tisgmlinbp, victim)
+        logger.info(f'tisgmlinbp_acc = {acc:.5f}, tisgmlinbp_loss = {loss:.5f}')
+
+        self.create_dir(self.args.datadir, 'ti-sgm-linbp', adv_examples)
 
 
 if __name__ == "__main__":
@@ -309,7 +305,7 @@ if __name__ == "__main__":
     parser.add_argument("--datadir", default="./cifar-100_eval")
     parser.add_argument("--num-workers", type=int, default=2)
     # training
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--accum-steps", type=int, default=1)
     parser.add_argument("--clip-norm", type=float, default=10.0)
     parser.add_argument("--max-epoch", type=int, default=90)

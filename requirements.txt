@@ -5,3 +5,5 @@ wandb
 pytorchcv
 scipy
 ipywidgets
+torchattacks
+Pillow
