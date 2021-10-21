@@ -88,11 +88,14 @@ class Trainer:
             momentum=0.875,
             weight_decay=3.0517578125e-05,
         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        #self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        #    self.optimizer,
+        #    T_0=10,
+        #    T_mult=2,
+        #    eta_min=0
+        #)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            T_0=10,
-            T_mult=2,
-            eta_min=0
         )
         self.initialize_stats()
 
@@ -146,7 +149,7 @@ class Trainer:
 
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step(self.epoch + i / n_iters)
+            #scheduler.step(self.epoch + i / n_iters)
 
             # logging
             loss_print = accum_loss / sample_size
@@ -154,7 +157,7 @@ class Trainer:
             infos = {
                 "train/loss": loss_print,
                 "train/grad_norm": gnorm.item(),
-                "train/lr": scheduler.get_last_lr()[0],
+                #"train/lr": scheduler.get_last_lr()[0],
                 "train/sample_size": sample_size,
             }
             progress.set_postfix(utils.floatdict2str(infos))
@@ -277,7 +280,8 @@ class Trainer:
         while self.epoch <= self.args.max_epoch:
             # train for one epoch
             self.train_one_epoch()
-            self.validate_and_save()
+            stats = self.validate_and_save()
+            self.scheduler.step(stats['loss'])
             logger.info("end of epoch {}".format(self.epoch))
 
 

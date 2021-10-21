@@ -1,3 +1,4 @@
+torch>=1.8
 qqdm
 torchinfo
 wandb
