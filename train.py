@@ -38,7 +38,8 @@ class Trainer:
         if args.use_wandb:
             wandb.init(project="resnet50-cifar100", name=Path(args.savedir).stem, config=args)
 
-        self.model = models.resnet.resnet50(num_classes=100)
+        # self.model = models.resnet.resnet50(num_classes=100)
+        self.model = models.resnet.cifar100_resnet56()
         logger.info(summary(self.model))
 
         self.train_set = datasets.CIFAR100(
