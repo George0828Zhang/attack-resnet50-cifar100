@@ -1,243 +1,159 @@
 '''
-Modified from https://raw.githubusercontent.com/pytorch/vision/v0.9.1/torchvision/models/resnet.py
+Properly implemented ResNet-s for CIFAR10 as described in paper [1].
 
-BSD 3-Clause License
+The implementation and structure of this file is hugely influenced by [2]
+which is implemented for ImageNet and doesn't have option A for identity.
+Moreover, most of the implementations on the web is copy-paste from
+torchvision's resnet and has wrong number of params.
 
-Copyright (c) Soumith Chintala 2016,
-All rights reserved.
+Proper ResNet-s for CIFAR10 (for fair comparision and etc.) has following
+number of layers and parameters:
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
+name      | layers | params
+ResNet20  |    20  | 0.27M
+ResNet32  |    32  | 0.46M
+ResNet44  |    44  | 0.66M
+ResNet56  |    56  | 0.85M
+ResNet110 |   110  |  1.7M
+ResNet1202|  1202  | 19.4m
 
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
+which this implementation indeed has.
 
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
+Reference:
+[1] Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
+    Deep Residual Learning for Image Recognition. arXiv:1512.03385
+[2] https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
 
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+If you use this implementation in you work, please don't forget to mention the
+author, Yerlan Idelbayev.
 '''
-import sys
+import torch
 import torch.nn as nn
-try:
-    from torch.hub import load_state_dict_from_url
-except ImportError:
-    from torch.utils.model_zoo import load_url as load_state_dict_from_url
+import torch.nn.functional as F
+import torch.nn.init as init
 
-from functools import partial
-from typing import Dict, Type, Any, Callable, Union, List, Optional
+from torch.autograd import Variable
 
+__all__ = ['ResNet', 'resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet110', 'resnet1202']
 
-cifar10_pretrained_weight_urls = {
-    'resnet20': 'https://github.com/chenyaofo/pytorch-cifar-models/releases/download/resnet/cifar10_resnet20-4118986f.pt',
-    'resnet32': 'https://github.com/chenyaofo/pytorch-cifar-models/releases/download/resnet/cifar10_resnet32-ef93fc4d.pt',
-    'resnet44': 'https://github.com/chenyaofo/pytorch-cifar-models/releases/download/resnet/cifar10_resnet44-2a3cabcb.pt',
-    'resnet56': 'https://github.com/chenyaofo/pytorch-cifar-models/releases/download/resnet/cifar10_resnet56-187c023a.pt',
-}
+def _weights_init(m):
+    classname = m.__class__.__name__
+    #print(classname)
+    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+        init.kaiming_normal_(m.weight)
 
-cifar100_pretrained_weight_urls = {
-    'resnet20': 'https://github.com/chenyaofo/pytorch-cifar-models/releases/download/resnet/cifar100_resnet20-23dac2f1.pt',
-    'resnet32': 'https://github.com/chenyaofo/pytorch-cifar-models/releases/download/resnet/cifar100_resnet32-84213ce6.pt',
-    'resnet44': 'https://github.com/chenyaofo/pytorch-cifar-models/releases/download/resnet/cifar100_resnet44-ffe32858.pt',
-    'resnet56': 'https://github.com/chenyaofo/pytorch-cifar-models/releases/download/resnet/cifar100_resnet56-f2eff4c8.pt',
-}
+class LambdaLayer(nn.Module):
+    def __init__(self, lambd):
+        super(LambdaLayer, self).__init__()
+        self.lambd = lambd
 
-
-def conv3x3(in_planes, out_planes, stride=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
-
-
-def conv1x1(in_planes, out_planes, stride=1):
-    """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+    def forward(self, x):
+        return self.lambd(x)
 
 
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, in_planes, planes, stride=1, option='A'):
         super(BasicBlock, self).__init__()
-        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
-        self.downsample = downsample
-        self.stride = stride
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            if option == 'A':
+                """
+                For CIFAR10 ResNet paper uses option A.
+                """
+                self.shortcut = LambdaLayer(lambda x:
+                                            F.pad(x[:, :, ::2, ::2], (0, 0, 0, 0, planes//4, planes//4), "constant", 0))
+            elif option == 'B':
+                self.shortcut = nn.Sequential(
+                     nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                     nn.BatchNorm2d(self.expansion * planes)
+                )
 
     def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-
-        return out
-
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None):
-        super(Bottleneck, self).__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        width = int(planes * (base_width / 64.)) * groups
-        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
-        self.conv1 = conv1x1(inplanes, width)
-        self.bn1 = norm_layer(width)
-        self.conv2 = conv3x3(width, width, stride)
-        self.bn2 = norm_layer(width)
-        self.conv3 = conv1x1(width, planes * self.expansion)
-        self.bn3 = norm_layer(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-    def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
         return out
 
 
-class CifarResNet(nn.Module):
+class ResNet(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=100):
+        super(ResNet, self).__init__()
+        self.in_planes = 16
 
-    def __init__(self, block, layers, num_classes=10):
-        super(CifarResNet, self).__init__()
-        self.inplanes = 16  # was 64
-        self.conv1 = conv3x3(3, 16)  # was 3->64, ker=7, stride=2, pad=3
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(16)
-        self.relu = nn.ReLU(inplace=True)
-        # was nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 16, layers[0])  # was 64
-        self.layer2 = self._make_layer(block, 32, layers[1], stride=2)  # was 128
-        self.layer3 = self._make_layer(block, 64, layers[2], stride=2)  # was 256
-        # was 512
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(64 * block.expansion, num_classes)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        self.linear = nn.Linear(64, num_classes)
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+        self.apply(_weights_init)
 
-    def _make_layer(self, block, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                nn.BatchNorm2d(planes * block.expansion),
-            )
-
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
-        for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
 
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        # was maxpool
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        # was layer4
-
-        x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-
-        return x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.avg_pool2d(out, out.size()[3])
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
 
 
-def _resnet(
-    arch: str,
-    layers: List[int],
-    model_urls: Dict[str, str],
-    progress: bool = True,
-    pretrained: bool = False,
-    **kwargs: Any
-) -> CifarResNet:
-    model = CifarResNet(Bottleneck, layers, **kwargs)
-    if pretrained:
-        state_dict = load_state_dict_from_url(model_urls[arch],
-                                              progress=progress)
-        model.load_state_dict(state_dict)
-    return model
+def resnet20():
+    return ResNet(BasicBlock, [3, 3, 3])
 
 
-def cifar10_resnet20(*args, **kwargs) -> CifarResNet: pass
-def cifar10_resnet32(*args, **kwargs) -> CifarResNet: pass
-def cifar10_resnet44(*args, **kwargs) -> CifarResNet: pass
-def cifar10_resnet56(*args, **kwargs) -> CifarResNet: pass
+def resnet32():
+    return ResNet(BasicBlock, [5, 5, 5])
 
 
-def cifar100_resnet20(*args, **kwargs) -> CifarResNet: pass
-def cifar100_resnet32(*args, **kwargs) -> CifarResNet: pass
-def cifar100_resnet44(*args, **kwargs) -> CifarResNet: pass
-def cifar100_resnet56(*args, **kwargs) -> CifarResNet: pass
+def resnet44():
+    return ResNet(BasicBlock, [7, 7, 7])
 
 
-thismodule = sys.modules[__name__]
-for dataset in ["cifar10", "cifar100"]:
-    for layers, model_name in zip([[3]*3, [5]*3, [7]*3, [9]*3],
-                                  ["resnet20", "resnet32", "resnet44", "resnet56"]):
-        method_name = f"{dataset}_{model_name}"
-        model_urls = cifar10_pretrained_weight_urls if dataset == "cifar10" else cifar100_pretrained_weight_urls
-        num_classes = 10 if dataset == "cifar10" else 100
-        setattr(
-            thismodule,
-            method_name,
-            partial(_resnet,
-                    arch=model_name,
-                    layers=layers,
-                    model_urls=model_urls,
-                    num_classes=num_classes)
-        )
+def resnet56():
+    return ResNet(BasicBlock, [9, 9, 9])
+
+
+def resnet110():
+    return ResNet(BasicBlock, [18, 18, 18])
+
+
+def resnet1202():
+    return ResNet(BasicBlock, [200, 200, 200])
+
+
+def test(net):
+    import numpy as np
+    total_params = 0
+
+    for x in filter(lambda p: p.requires_grad, net.parameters()):
+        total_params += np.prod(x.data.numpy().shape)
+    print("Total number of params", total_params)
+    print("Total layers", len(list(filter(lambda p: p.requires_grad and len(p.data.size())>1, net.parameters()))))
+
+
+if __name__ == "__main__":
+    for net_name in __all__:
+        if net_name.startswith('resnet'):
+            print(net_name)
+            test(globals()[net_name]())
+            print()

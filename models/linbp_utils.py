@@ -126,14 +126,18 @@ def block_func(block, x, linbp):
     out = block.conv2(out)
     out = block.bn2(out)
     out_1 = out + 0
-    if linbp:
-        out = linbp_relu(out_1)
-    else:
-        out = block.relu(out_1)
-    ori_mask_1 = out.data.bool().int()
+    ##### mod region
+    out = out_1
+    ori_mask_1 = torch.ones_like(out).int()
+    # if linbp:
+    #     out = linbp_relu(out_1)
+    # else:
+    #     out = block.relu(out_1)
+    # ori_mask_1 = out.data.bool().int()
 
-    out = block.conv3(out)
-    out = block.bn3(out)
+    # out = block.conv3(out)
+    # out = block.bn3(out)
+    ##### end
 
     if block.downsample is not None:
         identity = block.downsample(identity)

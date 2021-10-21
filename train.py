@@ -8,8 +8,8 @@ from torch.cuda.amp import GradScaler, autocast
 # general
 import shutil
 import numpy as np
-# import qqdm
-from qqdm import qqdm as tqdm
+# from qqdm import qqdm as tqdm
+from tqdm import tqdm
 import sys
 import logging
 import argparse
@@ -39,8 +39,8 @@ class Trainer:
             wandb.init(project="resnet50-cifar100", name=Path(args.savedir).stem, config=args)
 
         # self.model = models.resnet.resnet50(num_classes=100)
-        self.model = models.resnet.cifar100_resnet56()
-        logger.info(summary(self.model))
+        self.model = models.resnet.resnet56()
+        summary(self.model)
 
         self.train_set = datasets.CIFAR100(
             args.datadir,
@@ -88,12 +88,12 @@ class Trainer:
             momentum=0.875,
             weight_decay=3.0517578125e-05,
         )
-        #self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        #    self.optimizer,
-        #    T_0=10,
-        #    T_mult=2,
-        #    eta_min=0
-        #)
+        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        #     self.optimizer,
+        #     T_0=10,
+        #     T_mult=2,
+        #     eta_min=0,
+        # )
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
         )
@@ -157,10 +157,10 @@ class Trainer:
             infos = {
                 "train/loss": loss_print,
                 "train/grad_norm": gnorm.item(),
-                #"train/lr": scheduler.get_last_lr()[0],
+                # "train/lr": scheduler.get_last_lr()[0],
                 "train/sample_size": sample_size,
             }
-            progress.set_postfix(utils.floatdict2str(infos))
+            progress.set_postfix(**utils.floatdict2str(infos))
             if self.args.use_wandb:
                 wandb.log(infos)
 
@@ -192,7 +192,7 @@ class Trainer:
                 stats["loss"].append(loss.item())
                 stats["acc"].extend(acc)
                 progress.set_postfix(
-                    utils.floatdict2str({
+                    **utils.floatdict2str({
                         "valid/loss": loss.item(),
                         "valid/acc": np.mean(acc),
                     })
@@ -280,8 +280,7 @@ class Trainer:
         while self.epoch <= self.args.max_epoch:
             # train for one epoch
             self.train_one_epoch()
-            stats = self.validate_and_save()
-            self.scheduler.step(stats['loss'])
+            self.scheduler.step(self.validate_and_save()["loss"])
             logger.info("end of epoch {}".format(self.epoch))
 
 
