@@ -68,11 +68,11 @@ class Attacker:
         self.batch_size = args.batch_size
         self.device = torch.device('cuda' if args.cuda and torch.cuda.is_available() else 'cpu')
 
-        self.mean = torch.tensor(self.cifar_10_mean).to(device).view(3, 1, 1)
-        self.std = torch.tensor(self.cifar_10_std).to(device).view(3, 1, 1)
+        self.mean = torch.tensor(self.cifar_100_mean).to(self.device).view(3, 1, 1)
+        self.std = torch.tensor(self.cifar_100_std).to(self.device).view(3, 1, 1)
 
-        self.epsilon = 8/255/std
-        self.alpha = 1.0/255/std
+        self.epsilon = 8/255/self.std
+        self.alpha = 1.0/255/self.std
 
         self.adv_set = AdvDataset(
             args.datadir,
@@ -82,8 +82,8 @@ class Attacker:
             ]),
         )
         
-        self.adv_names = adv_set.__getname__()
-        self.adv_loader = DataLoader(adv_set, batch_size=self.batch_size, shuffle=False)
+        self.adv_names = self.adv_set.__getname__()
+        self.adv_loader = DataLoader(self.adv_set, batch_size=self.batch_size, shuffle=False)
 
         logger.info(f'number of images = {self.adv_set.__len__()}')
 
@@ -92,6 +92,7 @@ class Attacker:
     def epoch_benign(self, model):
         loader = self.adv_loader
         loss_fn = self.loss_fn
+        device = self.device
 
         model.eval()
         train_acc, train_loss = 0.0, 0.0
@@ -135,7 +136,7 @@ class Attacker:
 
     def try_load_checkpoint(self, model, name=None):
         name = name if name else "checkpoints/checkpoint_last.pt"
-        checkpath = Path(name) / name
+        checkpath = Path(name)
         if checkpath.exists():
             check = torch.load(checkpath)
             model.load_state_dict(check["model"])
@@ -175,7 +176,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    def fgsm(model, x, y, loss_fn, epsilon=epsilon):
+    def fgsm(model, x, y, loss_fn, epsilon):
         x_adv = x.detach().clone()
         x_adv.requires_grad = True
         loss = loss_fn(model(x_adv), y)
@@ -184,7 +185,7 @@ if __name__ == "__main__":
         x_adv = x_adv + epsilon * grad.sign()
         return x_adv
 
-    def ifgsm(model, x, y, loss_fn, epsilon=epsilon, alpha=alpha, num_iter=20):
+    def ifgsm(model, x, y, loss_fn, epsilon, alpha, num_iter=20):
         x_adv = x.detach().clone()
         for i in range(num_iter):
             x_adv = fgsm(model, x_adv, y, loss_fn, epsilon=alpha)
