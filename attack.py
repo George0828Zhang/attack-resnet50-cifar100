@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torchvision import datasets
 from torchvision.transforms import transforms
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
 
 # general
 import shutil
@@ -15,6 +14,7 @@ import argparse
 from pathlib import Path
 import os
 import glob
+import json
 
 # others
 from PIL import Image
@@ -29,7 +29,6 @@ from models.linbp_utils import (
     linbp_forw_resnet50,
     linbp_backw_resnet50,
 )
-import utils
 logger = logging.getLogger(__name__)
 
 cuclear = torch.cuda.empty_cache
@@ -144,7 +143,7 @@ class Attacker:
         )
 
         self.batch_size = args.batch_size
-        self.device = torch.device('cuda' if args.cuda and torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda' if not args.cpu and torch.cuda.is_available() else 'cpu')
 
         self.mean = torch.tensor(self.cifar_100_mean).to(self.device).view(3, 1, 1)
         self.std = torch.tensor(self.cifar_100_std).to(self.device).view(3, 1, 1)
@@ -168,6 +167,7 @@ class Attacker:
         self.loss_fn = nn.CrossEntropyLoss()
 
     def epoch_benign(self, model):
+        cuclear()
         with torch.no_grad():
             loader = self.adv_loader
             loss_fn = self.loss_fn
@@ -192,6 +192,7 @@ class Attacker:
         n_data = len(self.adv_loader.dataset)
         train_acc, train_loss = 0.0, 0.0
         for i, (x, y) in enumerate(self.adv_loader):
+            cuclear()
             x, y = x.to(device), y.to(device)
             x_adv = attack(model, x, y, self.loss_fn) # obtain adversarial examples
             with torch.no_grad():
@@ -215,22 +216,45 @@ class Attacker:
             im = Image.fromarray(example.astype(np.uint8)) # image pixel value should be unsigned int
             im.save(os.path.join(adv_dir, name))
 
+    def build_model(self, name):
+        if name.split("_").index("cifar100") == 0:
+            model = torch.hub.load(
+                "chenyaofo/pytorch-cifar-models",
+                name,
+                pretrained=True
+            )
+        else:
+            model = ptcv_get_model(name, pretrained=True)
+        model.eval()
+        model = model.to(self.device)
+        return model
+
     def solve(self,):
         device = self.device
-        model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar100_resnet56", pretrained=True).to(device)
-        victim = ptcv_get_model('densenet100_k24_cifar100', pretrained=True).to(device)
-        model.eval()
-        victim.eval()
+        # model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar100_resnet56", pretrained=True).to(device)
+        # victim = ptcv_get_model('densenet100_k24_cifar100', pretrained=True).to(device)
+        
+        model = self.build_model(self.args.model)
+        victim = None
+        if self.args.victim != self.args.model:
+            victim = self.build_model(self.args.victim)
 
-        # cuclear()
+        benign_acc, benign_loss = self.epoch_benign(model)
+        logger.info(f'source benign_acc = {benign_acc:.5f}, benign_loss = {benign_loss:.5f}')
 
-        # benign_acc, benign_loss = self.epoch_benign(model)
-        # logger.info(f'source benign_acc = {benign_acc:.5f}, benign_loss = {benign_loss:.5f}')
+        if victim is not None:
+            benign_acc, benign_loss = self.epoch_benign(victim)
+            logger.info(f'victim benign_acc = {benign_acc:.5f}, benign_loss = {benign_loss:.5f}')
 
-        # cuclear()
+        if self.args.attack == "none":
+            return
+        atk_cfg = self.args.atk_cfg
+        logger.info("source: {}".format(model.__class__.__name__))
+        if victim is not None:
+            logger.info("victim: {}".format(victim.__class__.__name__))
+        logger.info("attack: {}".format(self.args.attack))
+        logger.info("config: {}".format(atk_cfg))
 
-        # benign_acc, benign_loss = self.epoch_benign(victim)
-        # logger.info(f'benign_acc = {benign_acc:.5f}, benign_loss = {benign_loss:.5f}')
 
         def fgsm(model, x, y, loss_fn, epsilon=self.epsilon):
             x_adv = x.detach().clone()
@@ -241,7 +265,7 @@ class Attacker:
             x_adv = x_adv + epsilon * grad.sign()
             return x_adv
 
-        def ifgsm(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=20):
+        def ifgsm(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=atk_cfg["num_iter"]):
             x_adv = x.detach().clone()
             for i in range(num_iter):
                 x_adv = fgsm(model, x_adv, y, loss_fn, epsilon=alpha)
@@ -254,7 +278,7 @@ class Attacker:
                 x_adv = (x + delta).detach()
             return x_adv
 
-        def linbp(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=20, linbp_layer="3_4", sgm_lambda=1.0):
+        def linbp(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=atk_cfg["num_iter"], linbp_layer=atk_cfg["linbp_layer"], sgm_lambda=atk_cfg["sgm_lambda"]):
             x_adv = x.detach().clone()
             for i in range(num_iter):
                 x_adv.requires_grad = True
@@ -269,34 +293,39 @@ class Attacker:
 
         # cuclear()
         # adv_examples, acc, loss = self.gen_adv_examples(model, fgsm, victim)
-        # logger.info(f'fgsm_acc = {acc:.5f}, fgsm_loss = {loss:.5f}')
+        # logger.info(f'attack fgsm_acc = {acc:.5f}, fgsm_loss = {loss:.5f}')
 
         # cuclear()
         # adv_examples, acc, loss = self.gen_adv_examples(model, ifgsm, victim)
-        # logger.info(f'ifgsm_acc = {acc:.5f}, ifgsm_loss = {loss:.5f}')
+        # logger.info(f'attack ifgsm_acc = {acc:.5f}, ifgsm_loss = {loss:.5f}')
 
         
         # cuclear()
         # adv_examples, acc, loss = self.gen_adv_examples(model, linbp, victim)
-        # logger.info(f'linbp_acc = {acc:.5f}, linbp_loss = {loss:.5f}')
+        # logger.info(f'attack linbp_acc = {acc:.5f}, linbp_loss = {loss:.5f}')
 
-        tisgmlinbp = TISGMLinBP(
+        tisgbp = TISGMLinBP(
             model, 
             eps=self.epsilon, 
             alpha=self.alpha, 
-            steps=20, 
+            steps=atk_cfg["num_iter"],
             decay=0.,
             kernel_name='gaussian',
-            linbp_layer="3_4",
-            sgm_lambda=0.5
+            linbp_layer=atk_cfg["linbp_layer"],
+            sgm_lambda=atk_cfg["sgm_lambda"]
         )
 
-        cuclear()
-        # ti + linbp + sgm
-        adv_examples, acc, loss = self.gen_adv_examples(model, tisgmlinbp, victim)
-        logger.info(f'tisgmlinbp_acc = {acc:.5f}, tisgmlinbp_loss = {loss:.5f}')
+        atk_fn = {
+            "fgsm": fgsm,
+            "ifgsm": ifgsm,
+            "linbp": linbp,
+            "tisgbp": tisgbp
+        }[self.args.attack]
+        adv_examples, acc, loss = self.gen_adv_examples(model, atk_fn, victim)
+        logger.info(f'attack {self.args.attack}_acc = {acc:.5f}, {self.args.attack}_loss = {loss:.5f}')
 
-        self.create_dir(self.args.datadir, 'ti-sgm-linbp', adv_examples)
+        if self.args.save_adv is not None:
+            self.create_dir(self.args.datadir, self.args.save_adv, adv_examples)
 
 
 if __name__ == "__main__":
@@ -310,10 +339,19 @@ if __name__ == "__main__":
     parser.add_argument("--clip-norm", type=float, default=10.0)
     parser.add_argument("--max-epoch", type=int, default=90)
     parser.add_argument("--start-epoch", type=int, default=1)
-    parser.add_argument("--cuda", action="store_true")
+    parser.add_argument("--cpu", action="store_true")
     # checkpoint
-    parser.add_argument("--resume", default="")
+    parser.add_argument("--model", default="cifar100_resnet56")
+    parser.add_argument("--victim", default='densenet100_k24_cifar100')
+    parser.add_argument("--attack", default='none', choices=[
+        "none", "fgsm", "ifgsm", "linbp", "tisgbp",
+    ])
+    parser.add_argument("--atk-cfg", default='{"num_iter":20, "linbp_layer":"3_4", "sgm_lambda":1.0}')
+    parser.add_argument("--save-adv", default=None) #'ti-sgm-linbp'
 
     args = parser.parse_args()
+    defaults = {"num_iter":20, "linbp_layer":"3_4", "sgm_lambda":1.0}
+    defaults.update(json.loads(args.atk_cfg))
+    args.atk_cfg = defaults
 
     Attacker(args).solve()
