@@ -31,6 +31,13 @@ from models.linbp_utils import (
 logger = logging.getLogger(__name__)
 
 cuclear = torch.cuda.empty_cache
+@torch.no_grad()
+def clamp(x_adv, x, epsilon, margin=1e-6):
+    tmp = x + (epsilon - margin)
+    x_adv = torch.where(x_adv > tmp, tmp, x_adv)
+    tmp = x - (epsilon - margin)
+    x_adv = torch.where(x_adv < tmp, tmp, x_adv)
+    return x_adv
 
 class AdvDataset(Dataset):
     def __init__(self, data_dir, transform):
@@ -77,14 +84,11 @@ class Attacker:
         self.batch_size = args.batch_size
         self.device = torch.device('cuda' if not args.cpu and torch.cuda.is_available() else 'cpu')
 
-        self.mean = torch.tensor(self.cifar_100_mean).to(self.device).view(3, 1, 1)
-        self.std = torch.tensor(self.cifar_100_std).to(self.device).view(3, 1, 1)
+        self.mean = torch.tensor(self.cifar_100_mean).to(self.device).view(1, 3, 1, 1)
+        self.std = torch.tensor(self.cifar_100_std).to(self.device).view(1, 3, 1, 1)
 
-        self.epsilon = args.epsilon_pixels/self.std/255
-        self.alpha = 0.8/self.std/255
-
-        # logger.info(
-        #     f"normalized epsilon: {self.epsilon.squeeze().tolist()}, alpha: {self.alpha.squeeze().tolist()}")
+        self.epsilon = args.epsilon_pixels/self.std/255.
+        self.alpha = 0.8/self.std/255.
 
         self.adv_set = AdvDataset(
             args.datadir,
@@ -131,6 +135,11 @@ class Attacker:
             x, y = x.to(device), y.to(device)
             x_adv = attack(model, x, y, self.loss_fn) # obtain adversarial examples
             with torch.no_grad():
+                error = (x_adv - x).abs()
+                if (error > self.epsilon).any():
+                    import pdb; pdb.set_trace()
+                
+                assert (error <= self.epsilon).all(), f"allowed: {self.epsilon.squeeze().tolist()}, got max: {error.max()} avg: {error.mean()}"
                 yp = victim(x_adv)
                 loss = self.loss_fn(yp, y)
                 train_acc += (yp.argmax(dim=1) == y).sum().item()
@@ -185,22 +194,42 @@ class Attacker:
             logger.info("victim: {}".format(victim.__class__.__name__))
         logger.info("attack: {}".format(self.args.attack))
 
-        def fgsm(model, x, y, loss_fn, epsilon=self.epsilon):
-            x_adv = x.detach().clone()
-            x_adv.requires_grad = True
-            loss = loss_fn(model(x_adv), y)
-            loss.backward()
-            grad = x_adv.grad.detach()
-            x_adv = x_adv + epsilon * grad.sign()
-            return x_adv
-
         def ifgsm(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=self.args.num_iter):
             x_adv = x.detach().clone()
             for i in range(num_iter):
-                x_adv = fgsm(model, x_adv, y, loss_fn, epsilon=alpha)
-                delta = torch.clamp(x_adv - x, min=-epsilon, max=epsilon)
-                x_adv = (x + delta).detach()
+                x_adv.requires_grad = True
+                loss = loss_fn(model(x_adv), y)
+                loss.backward()
+                grad = x_adv.grad.detach()
+                x_adv = x_adv + epsilon * grad.sign()
+                x_adv = clamp(x_adv, x, epsilon)
             return x_adv
+
+        def fgsm(model, x, y, loss_fn, epsilon=self.epsilon):
+            return ifgsm(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.epsilon, num_iter=1)
+
+        def input_diversity(x, resize_rate=1.25, diversity_prob=0.5):
+            mode = 'nearest' # 'bilinear'
+            img_size = x.shape[-1]
+            img_resize = int(img_size * resize_rate)
+
+            if resize_rate < 1:
+                img_size = img_resize
+                img_resize = x.shape[-1]
+
+            rnd = torch.randint(low=img_size, high=img_resize, size=(1,), dtype=torch.int32)
+            rescaled = F.interpolate(x, size=[rnd, rnd], mode=mode) #, align_corners=False)
+            h_rem = img_resize - rnd
+            w_rem = img_resize - rnd
+            pad_top = torch.randint(low=0, high=h_rem.item()+1, size=(1,), dtype=torch.int32)
+            pad_bottom = h_rem - pad_top
+            pad_left = torch.randint(low=0, high=w_rem.item()+1, size=(1,), dtype=torch.int32)
+            pad_right = w_rem - pad_left
+
+            padded = F.pad(rescaled, [pad_left.item(), pad_right.item(), pad_top.item(), pad_bottom.item()], value=0)
+            padded = F.interpolate(padded, (img_size, img_size), mode=mode)
+            return padded if torch.rand(1) < diversity_prob else x
+
 
         def linbp(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=self.args.num_iter, linbp_layer=self.args.linbp_layer, sgm_lambda=self.args.sgm_lambda):
             x_adv = x.detach().clone()
@@ -211,8 +240,7 @@ class Attacker:
                 model.zero_grad()
                 grad = linbp_backw_resnet50(x_adv, loss, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=sgm_lambda)
                 x_adv = x_adv.data + alpha * grad.sign()
-                x_adv = torch.where(x_adv > x + epsilon, x + epsilon, x_adv)
-                x_adv = torch.where(x_adv < x - epsilon, x - epsilon, x_adv)
+                x_adv = clamp(x_adv, x, epsilon)
             return x_adv
 
         if self.args.attack == "fgsm":
@@ -235,16 +263,17 @@ class Attacker:
 
         if self.args.savedir is not None:
             logger.info("validating image constraints...")
-            final_adv = []
+            # final_adv = []
             for idx, im in enumerate(adv_examples):
                 orig = np.array(Image.open(self.adv_set.images[idx]))
                 error = np.absolute(im - orig)
-                if (error > self.args.epsilon_pixels).any():
-                    logger.warning(f"allowed: {args.epsilon_pixels}, got max: {error.max()} avg: {error.mean()}")
-                final_adv.append(
-                    np.clip(im, orig-args.epsilon_pixels, orig+args.epsilon_pixels))
+                assert not (error > self.args.epsilon_pixels).any()
+                # if (error > self.args.epsilon_pixels).any():
+                #     logger.warning(f"allowed: {self.args.epsilon_pixels}, got max: {error.max()} avg: {error.mean()}")
+                # final_adv.append(
+                #     np.clip(im, orig-args.epsilon_pixels, orig+args.epsilon_pixels))
 
-            self.create_dir(self.args.datadir, self.args.savedir, final_adv)
+            self.create_dir(self.args.datadir, self.args.savedir, adv_examples)
 
 
 if __name__ == "__main__":
