@@ -21,7 +21,6 @@ from PIL import Image
 from torchinfo import summary
 from qqdm import qqdm as tqdm
 from pytorchcv.model_provider import get_model as ptcv_get_model
-from torchattacks import TIFGSM
 
 # local
 import models
@@ -62,73 +61,6 @@ class AdvDataset(Dataset):
         return len(self.images)
 
 
-class TISGMLinBP(TIFGSM):
-    def __init__(
-        self,
-        *args,
-        linbp_layer="3_1",
-        sgm_lambda=1.0,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.linbp_layer = linbp_layer
-        self.sgm_lambda = sgm_lambda
-
-    def forward(
-        self,
-        model,
-        x,
-        y,
-        loss_fn,
-    ):
-        r"""
-        Overridden.
-        """
-        images = x.clone().detach().to(self.device)
-        labels = y.clone().detach().to(self.device)
-
-        if self._targeted:
-            target_labels = self._get_target_label(images, labels)
-
-        momentum = torch.zeros_like(images).detach().to(self.device)
-        stacked_kernel = self.stacked_kernel.to(self.device)
-
-        adv_images = images.clone().detach()
-
-        if self.random_start:
-            # Starting at a uniformly random point
-            adv_images = adv_images + torch.empty_like(adv_images).uniform_(-self.eps, self.eps)
-            adv_images = torch.clamp(adv_images, min=0, max=1).detach()
-
-        for _ in range(self.steps):
-            adv_images.requires_grad = True
-            # outputs = self.model(self.input_diversity(adv_images))
-            outputs, ori_mask_ls, conv_out_ls, relu_out_ls, conv_input_ls = linbp_forw_resnet50(
-                self.model, self.input_diversity(adv_images), True, self.linbp_layer)
-                
-            # Calculate loss
-            if self._targeted:
-                cost = -loss_fn(outputs, target_labels)
-            else:
-                cost = loss_fn(outputs, labels)
-
-            # Update adversarial images
-            # grad = torch.autograd.grad(cost, adv_images,
-            #                            retain_graph=False, create_graph=False)[0]
-            grad = linbp_backw_resnet50(adv_images, cost, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=self.sgm_lambda)
-
-            # depth wise conv2d
-            grad = F.conv2d(grad, stacked_kernel, stride=1, padding='same', groups=3)
-            grad = grad / torch.mean(torch.abs(grad), dim=(1,2,3), keepdim=True)
-            grad = grad + momentum*self.decay
-            momentum = grad
-
-            adv_images = adv_images.detach() + self.alpha*grad.sign()
-            delta = torch.clamp(adv_images - images, min=-self.eps, max=self.eps)
-            adv_images = torch.clamp(images + delta, min=0, max=1).detach()
-
-        return adv_images
-
 class Attacker:
     cifar_100_mean = [0.5070, 0.4865, 0.4409]
     cifar_100_std = [0.2673, 0.2564, 0.2761]
@@ -148,8 +80,11 @@ class Attacker:
         self.mean = torch.tensor(self.cifar_100_mean).to(self.device).view(3, 1, 1)
         self.std = torch.tensor(self.cifar_100_std).to(self.device).view(3, 1, 1)
 
-        self.epsilon = 8/255/self.std
-        self.alpha = 0.8/255/self.std
+        self.epsilon = args.epsilon_pixels/self.std/255
+        self.alpha = 0.8/self.std/255
+
+        # logger.info(
+        #     f"normalized epsilon: {self.epsilon.squeeze().tolist()}, alpha: {self.alpha.squeeze().tolist()}")
 
         self.adv_set = AdvDataset(
             args.datadir,
@@ -229,11 +164,7 @@ class Attacker:
         model = model.to(self.device)
         return model
 
-    def solve(self,):
-        device = self.device
-        # model = torch.hub.load("chenyaofo/pytorch-cifar-models", "cifar100_resnet56", pretrained=True).to(device)
-        # victim = ptcv_get_model('densenet100_k24_cifar100', pretrained=True).to(device)
-        
+    def solve(self,):        
         model = self.build_model(self.args.model)
         victim = None
         if self.args.victim != self.args.model:
@@ -248,13 +179,11 @@ class Attacker:
 
         if self.args.attack == "none":
             return
-        atk_cfg = self.args.atk_cfg
+
         logger.info("source: {}".format(model.__class__.__name__))
         if victim is not None:
             logger.info("victim: {}".format(victim.__class__.__name__))
         logger.info("attack: {}".format(self.args.attack))
-        logger.info("config: {}".format(atk_cfg))
-
 
         def fgsm(model, x, y, loss_fn, epsilon=self.epsilon):
             x_adv = x.detach().clone()
@@ -265,20 +194,15 @@ class Attacker:
             x_adv = x_adv + epsilon * grad.sign()
             return x_adv
 
-        def ifgsm(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=atk_cfg["num_iter"]):
+        def ifgsm(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=self.args.num_iter):
             x_adv = x.detach().clone()
             for i in range(num_iter):
                 x_adv = fgsm(model, x_adv, y, loss_fn, epsilon=alpha)
-                # delta = x_adv - x
-                # delta = torch.stack(
-                #     [torch.clip(delta[:,j,...], min=-epsilon[j].item(), max=epsilon[j].item()) for j in range(3)],
-                #     dim=1,
-                # )
                 delta = torch.clamp(x_adv - x, min=-epsilon, max=epsilon)
                 x_adv = (x + delta).detach()
             return x_adv
 
-        def linbp(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=atk_cfg["num_iter"], linbp_layer=atk_cfg["linbp_layer"], sgm_lambda=atk_cfg["sgm_lambda"]):
+        def linbp(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=self.args.num_iter, linbp_layer=self.args.linbp_layer, sgm_lambda=self.args.sgm_lambda):
             x_adv = x.detach().clone()
             for i in range(num_iter):
                 x_adv.requires_grad = True
@@ -286,46 +210,41 @@ class Attacker:
                 loss = loss_fn(att_out, y)
                 model.zero_grad()
                 grad = linbp_backw_resnet50(x_adv, loss, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=sgm_lambda)
-                x_adv = x_adv + alpha * grad.sign()
-                delta = torch.clamp(x_adv - x, min=-epsilon, max=epsilon)
-                x_adv = (x + delta).detach()
+                x_adv = x_adv.data + alpha * grad.sign()
+                x_adv = torch.where(x_adv > x + epsilon, x + epsilon, x_adv)
+                x_adv = torch.where(x_adv < x - epsilon, x - epsilon, x_adv)
             return x_adv
 
-        # cuclear()
-        # adv_examples, acc, loss = self.gen_adv_examples(model, fgsm, victim)
-        # logger.info(f'attack fgsm_acc = {acc:.5f}, fgsm_loss = {loss:.5f}')
+        if self.args.attack == "fgsm":
+            atk_fn = fgsm
+        elif self.args.attack == "ifgsm":
+            atk_fn = ifgsm
+            logger.info("num iters: {}".format(self.args.num_iter))
+        elif self.args.attack == "linbp":
+            atk_fn = linbp
+            assert self.args.linbp_layer != None
+            logger.info("num iters: {}".format(self.args.num_iter))
+            logger.info("linear BP layer start: {}".format(self.args.linbp_layer))
+            logger.info("SGM factor: {}".format(self.args.sgm_lambda))
+        else:
+            raise NotImplementedError(f"{self.args.attack} attack not implemented")
 
-        # cuclear()
-        # adv_examples, acc, loss = self.gen_adv_examples(model, ifgsm, victim)
-        # logger.info(f'attack ifgsm_acc = {acc:.5f}, ifgsm_loss = {loss:.5f}')
 
-        
-        # cuclear()
-        # adv_examples, acc, loss = self.gen_adv_examples(model, linbp, victim)
-        # logger.info(f'attack linbp_acc = {acc:.5f}, linbp_loss = {loss:.5f}')
-
-        tisgbp = TISGMLinBP(
-            model, 
-            eps=self.epsilon, 
-            alpha=self.alpha, 
-            steps=atk_cfg["num_iter"],
-            decay=0.,
-            kernel_name='gaussian',
-            linbp_layer=atk_cfg["linbp_layer"],
-            sgm_lambda=atk_cfg["sgm_lambda"]
-        )
-
-        atk_fn = {
-            "fgsm": fgsm,
-            "ifgsm": ifgsm,
-            "linbp": linbp,
-            "tisgbp": tisgbp
-        }[self.args.attack]
         adv_examples, acc, loss = self.gen_adv_examples(model, atk_fn, victim)
         logger.info(f'attack {self.args.attack}_acc = {acc:.5f}, {self.args.attack}_loss = {loss:.5f}')
 
-        if self.args.save_adv is not None:
-            self.create_dir(self.args.datadir, self.args.save_adv, adv_examples)
+        if self.args.savedir is not None:
+            logger.info("validating image constraints...")
+            final_adv = []
+            for idx, im in enumerate(adv_examples):
+                orig = np.array(Image.open(self.adv_set.images[idx]))
+                error = np.absolute(im - orig)
+                if (error > self.args.epsilon_pixels).any():
+                    logger.warning(f"allowed: {args.epsilon_pixels}, got max: {error.max()} avg: {error.mean()}")
+                final_adv.append(
+                    np.clip(im, orig-args.epsilon_pixels, orig+args.epsilon_pixels))
+
+            self.create_dir(self.args.datadir, self.args.savedir, final_adv)
 
 
 if __name__ == "__main__":
@@ -333,25 +252,21 @@ if __name__ == "__main__":
     # data
     parser.add_argument("--datadir", default="./cifar-100_eval")
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--epsilon-pixels", type=float, default=8)
     # training
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--accum-steps", type=int, default=1)
-    parser.add_argument("--clip-norm", type=float, default=10.0)
-    parser.add_argument("--max-epoch", type=int, default=90)
-    parser.add_argument("--start-epoch", type=int, default=1)
     parser.add_argument("--cpu", action="store_true")
     # checkpoint
     parser.add_argument("--model", default="cifar100_resnet56")
     parser.add_argument("--victim", default='densenet100_k24_cifar100')
     parser.add_argument("--attack", default='none', choices=[
-        "none", "fgsm", "ifgsm", "linbp", "tisgbp",
+        "none", "fgsm", "ifgsm", "linbp",
     ])
-    parser.add_argument("--atk-cfg", default='{"num_iter":20, "linbp_layer":"3_4", "sgm_lambda":1.0}')
-    parser.add_argument("--save-adv", default=None) #'ti-sgm-linbp'
+    parser.add_argument("--iters", type=int, dest="num_iter", default=1)
+    parser.add_argument("--linbp-layer", default=None) #"3_4")
+    parser.add_argument("--sgm-lambda",  type=float, default=0.5)
+    parser.add_argument("--savedir", default=None) #'ti-sgm-linbp'
 
     args = parser.parse_args()
-    defaults = {"num_iter":20, "linbp_layer":"3_4", "sgm_lambda":1.0}
-    defaults.update(json.loads(args.atk_cfg))
-    args.atk_cfg = defaults
 
     Attacker(args).solve()

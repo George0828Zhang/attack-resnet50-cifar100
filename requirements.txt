@@ -1,9 +1,9 @@
 torch>=1.8
+torchvision>=0.11
 qqdm
 torchinfo
 wandb
 pytorchcv
 scipy
 ipywidgets
-torchattacks
 Pillow
