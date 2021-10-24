@@ -17,10 +17,12 @@ import glob
 import json
 
 # others
+import wandb
 from PIL import Image
 from torchinfo import summary
 from qqdm import qqdm as tqdm
 from pytorchcv.model_provider import get_model as ptcv_get_model
+from torchattacks import TIFGSM
 
 # local
 import models
@@ -38,6 +40,92 @@ def clamp(x_adv, x, epsilon, margin=1e-6):
     tmp = x - (epsilon - margin)
     x_adv = torch.where(x_adv < tmp, tmp, x_adv)
     return x_adv
+
+@torch.no_grad()
+def zero_one_clamp(x, mean=0, std=1, margin=1e-6):
+    x = torch.clamp(
+        x * std + mean,
+        min=margin,
+        max=1-margin
+    )
+    return (x - mean) / std
+
+class TIFGSM2(TIFGSM):
+    def __init__(
+        self,
+        *args,
+        mean=None,
+        std=None,
+        margin=1e-6,
+        linbp_layer='2_8',
+        sgm_lambda=0.5,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.linbp_layer = linbp_layer
+        self.sgm_lambda = sgm_lambda
+        self.mean = mean
+        self.std = std
+        self.margin = margin
+        self.linbp_layer = linbp_layer
+        self.sgm_lambda = sgm_lambda
+
+    def forward(self, model, x, y, loss_fn):
+        r"""
+        Overridden.
+        """
+        images = x.clone().detach().to(self.device)
+        labels = y.clone().detach().to(self.device)
+
+        if self._targeted:
+            target_labels = self._get_target_label(images, labels)
+
+        momentum = torch.zeros_like(images).detach().to(self.device)
+        stacked_kernel = self.stacked_kernel.to(self.device)
+
+        adv_images = images.clone().detach()
+
+        if self.random_start:
+            # Starting at a uniformly random point
+            epsnum = self.eps.min().item()
+            adv_images = adv_images + torch.empty_like(adv_images).uniform_(-epsnum, epsnum)
+            adv_images = zero_one_clamp(adv_images, self.mean, self.std)
+
+        for _ in range(self.steps):
+            adv_images.requires_grad = True
+            # outputs = self.model(self.input_diversity(adv_images))
+            if self.linbp_layer is not None:
+                outputs, ori_mask_ls, conv_out_ls, relu_out_ls, conv_input_ls = linbp_forw_resnet50(
+                    model, self.input_diversity(adv_images), True, self.linbp_layer)
+            else:
+                outputs = model(self.input_diversity(adv_images))
+
+            # Calculate loss
+            if self._targeted:
+                cost = -loss_fn(outputs, target_labels)
+            else:
+                cost = loss_fn(outputs, labels)
+
+            # Update adversarial images
+            if self.linbp_layer is not None:
+                grad = linbp_backw_resnet50(
+                    adv_images, cost, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=self.sgm_lambda)
+            else:
+                grad = torch.autograd.grad(cost, adv_images,
+                                           retain_graph=False, create_graph=False)[0]
+            # depth wise conv2d
+            grad = F.conv2d(grad, stacked_kernel, stride=1, padding='same', groups=3)
+            grad = grad / torch.mean(torch.abs(grad), dim=(1,2,3), keepdim=True)
+            grad = grad + momentum*self.decay
+            momentum = grad
+
+            adv_images = adv_images.detach() + self.alpha*grad.sign()
+            adv_images = clamp(adv_images, images, self.eps)
+            adv_images = zero_one_clamp(adv_images, self.mean, self.std)
+
+        return adv_images
+
+
 
 class AdvDataset(Dataset):
     def __init__(self, data_dir, transform):
@@ -254,6 +342,30 @@ class Attacker:
             logger.info("num iters: {}".format(self.args.num_iter))
             logger.info("linear BP layer start: {}".format(self.args.linbp_layer))
             logger.info("SGM factor: {}".format(self.args.sgm_lambda))
+        elif self.args.attack == "tifgsm":
+            cfg = {
+                "decay": self.args.decay,
+                "kernel_name": self.args.kernel_name,
+                "len_kernel": self.args.len_kernel,
+                "nsig": self.args.nsig,  # radius for gaussian
+                "resize_rate": self.args.resize_rate,
+                "diversity_prob": self.args.diversity_prob,
+                "random_start": self.args.random_start,  # pgd
+                "linbp_layer":self.args.linbp_layer,
+                "sgm_lambda":self.args.sgm_lambda,
+            }
+            atk_fn = TIFGSM2(
+                model,
+                eps=self.epsilon, 
+                alpha=self.alpha, 
+                steps=self.args.num_iter, 
+                mean=self.mean,
+                std=self.std,
+                **cfg
+            )
+            logger.info("num iters: {}".format(self.args.num_iter))
+            for k, v in cfg.items():
+                logger.info("{}: {}".format(k, v))
         else:
             raise NotImplementedError(f"{self.args.attack} attack not implemented")
 
@@ -289,12 +401,21 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="cifar100_resnet56")
     parser.add_argument("--victim", default='densenet100_k24_cifar100')
     parser.add_argument("--attack", default='none', choices=[
-        "none", "fgsm", "ifgsm", "linbp",
+        "none", "fgsm", "ifgsm", "linbp", "tifgsm"
     ])
     parser.add_argument("--iters", type=int, dest="num_iter", default=1)
     parser.add_argument("--linbp-layer", default=None) #"3_4")
     parser.add_argument("--sgm-lambda",  type=float, default=0.5)
-    parser.add_argument("--savedir", default=None) #'ti-sgm-linbp'
+
+    parser.add_argument("--decay", type=float, default=0.0)
+    parser.add_argument("--kernel-name",  choices=['gaussian', 'uniform', 'linear'], default='gaussian')
+    parser.add_argument("--len-kernel",  type=int, default=5)
+    parser.add_argument("--nsig", type=int, default=3)
+    parser.add_argument("--resize-rate", type=float, default=1.25)
+    parser.add_argument("--diversity-prob", type=float, default=0.6)
+    parser.add_argument("--random-start", action='store_true')
+
+    parser.add_argument("--savedir", default=None)
 
     args = parser.parse_args()
 
