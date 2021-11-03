@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import datasets
 from torchvision.transforms import transforms
 from torch.utils.data import Dataset, DataLoader
 
@@ -12,16 +11,11 @@ import numpy as np
 import sys
 import logging
 import argparse
-from pathlib import Path
 import os
 import glob
-import json
 
 # others
-import wandb
 from PIL import Image
-from torchinfo import summary
-from qqdm import qqdm as tqdm
 from pytorchcv.model_provider import get_model as ptcv_get_model
 from torchattacks import TIFGSM
 
@@ -269,7 +263,8 @@ class Attacker:
             model = torch.hub.load(
                 "chenyaofo/pytorch-cifar-models",
                 name,
-                pretrained=True
+                pretrained=True,
+                verbose=False,
             )
         else:
             model = ptcv_get_model(name, pretrained=True)
@@ -307,19 +302,22 @@ class Attacker:
             logger.info("victim: {}".format(victim.__class__.__name__))
         logger.info("attack: {}".format(self.args.attack))
 
-        def ifgsm(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=self.args.num_iter):
+        def ifgsm(models, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=self.args.num_iter):
             x_adv = x.detach().clone()
             for i in range(num_iter):
                 x_adv.requires_grad = True
-                loss = loss_fn(model(x_adv), y)
-                loss.backward()
+                if x_adv.grad is not None:
+                    x_adv.grad.zero_()
+                for model in models:
+                    loss = loss_fn(model(x_adv), y)
+                    loss.backward(retain_graph=True)
                 grad = x_adv.grad.detach()
                 x_adv = x_adv + epsilon * grad.sign()
                 x_adv = clamp(x_adv, x, epsilon)
             return x_adv
 
-        def fgsm(model, x, y, loss_fn, epsilon=self.epsilon):
-            return ifgsm(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.epsilon, num_iter=1)
+        def fgsm(models, x, y, loss_fn, epsilon=self.epsilon):
+            return ifgsm(models, x, y, loss_fn, epsilon=self.epsilon, alpha=self.epsilon, num_iter=1)
 
         def input_diversity(x, resize_rate=1.25, diversity_prob=0.5):
             mode = 'nearest'  # 'bilinear'
@@ -421,36 +419,40 @@ class Attacker:
 
             self.create_dir(self.args.datadir, self.args.savedir, adv_examples)
 
+    @staticmethod
+    def add_args(parser):
+        # data
+        parser.add_argument("--datadir", default="./cifar-100_eval")
+        parser.add_argument("--num-workers", type=int, default=2)
+        parser.add_argument("--epsilon-pixels", type=float, default=8)
+        # training
+        parser.add_argument("--batch-size", type=int, default=16)
+        parser.add_argument("--cpu", action="store_true")
+        # checkpoint
+        parser.add_argument("--model", default="cifar100_resnet56")
+        parser.add_argument("--victim", default='densenet100_k24_cifar100')
+        parser.add_argument("--attack", default='none', choices=[
+            "none", "fgsm", "ifgsm", "linbp", "tifgsm"
+        ])
+        parser.add_argument("--iters", type=int, dest="num_iter", default=1)
+        parser.add_argument("--linbp-layer", default=None)
+        parser.add_argument("--sgm-lambda", type=float, default=0.5)
+
+        parser.add_argument("--decay", type=float, default=0.0)
+        parser.add_argument("--kernel-name", choices=['gaussian', 'uniform', 'linear'], default='gaussian')
+        parser.add_argument("--len-kernel", type=int, default=5)
+        parser.add_argument("--nsig", type=int, default=3)
+        parser.add_argument("--resize-rate", type=float, default=1.25)
+        parser.add_argument("--diversity-prob", type=float, default=0.6)
+        parser.add_argument("--random-start", action='store_true')
+
+        parser.add_argument("--savedir", default=None)
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # data
-    parser.add_argument("--datadir", default="./cifar-100_eval")
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--epsilon-pixels", type=float, default=8)
-    # training
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--cpu", action="store_true")
-    # checkpoint
-    parser.add_argument("--model", default="cifar100_resnet56")
-    parser.add_argument("--victim", default='densenet100_k24_cifar100')
-    parser.add_argument("--attack", default='none', choices=[
-        "none", "fgsm", "ifgsm", "linbp", "tifgsm"
-    ])
-    parser.add_argument("--iters", type=int, dest="num_iter", default=1)
-    parser.add_argument("--linbp-layer", default=None)
-    parser.add_argument("--sgm-lambda", type=float, default=0.5)
-
-    parser.add_argument("--decay", type=float, default=0.0)
-    parser.add_argument("--kernel-name", choices=['gaussian', 'uniform', 'linear'], default='gaussian')
-    parser.add_argument("--len-kernel", type=int, default=5)
-    parser.add_argument("--nsig", type=int, default=3)
-    parser.add_argument("--resize-rate", type=float, default=1.25)
-    parser.add_argument("--diversity-prob", type=float, default=0.6)
-    parser.add_argument("--random-start", action='store_true')
-
-    parser.add_argument("--savedir", default=None)
-
+    Attacker.add_args(parser)
     args = parser.parse_args()
 
     Attacker(args).solve()
