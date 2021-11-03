@@ -46,8 +46,21 @@ python attack.py --attack linbp \
     --sgm-lambda 0.5 \
     --savedir adv_images/
 ```
+5. use resnet56,44,32,20 as source and densenet (default) as victim, then use SGM+LinBP attack with
+- ensemble attack
+- 30-iteration
+- linear bp after each specified layer/block
+- then save the images in adv_images/
+```bash
+python attack.py --attack linbp \
+    --iters 30 \
+    --model cifar100_resnet56,cifar100_resnet44,cifar100_resnet32,cifar100_resnet20 \
+    --linbp-layer 2_8,2_5,2_1,1_3 \
+    --sgm-lambda 0.5 \
+    --savedir adv_images/
+```
 
-## use other models
+## Use other models
 Choose any of the Cifar100 models in these directories:
 ### pytorchcv
 Choose any in [link](https://github.com/osmr/imgclsmob/blob/master/pytorch/pytorchcv/model_provider.py) with cifar100 in its name.
