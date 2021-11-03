@@ -6,6 +6,7 @@ from torchvision.transforms import transforms
 from torch.utils.data import Dataset, DataLoader
 
 # general
+import math
 import shutil
 import numpy as np
 import sys
@@ -25,7 +26,6 @@ from pytorchcv.model_provider import get_model as ptcv_get_model
 from torchattacks import TIFGSM
 
 # local
-import models
 from models.linbp_utils import (
     linbp_forw_resnet50,
     linbp_backw_resnet50,
@@ -33,6 +33,8 @@ from models.linbp_utils import (
 logger = logging.getLogger(__name__)
 
 cuclear = torch.cuda.empty_cache
+
+
 @torch.no_grad()
 def clamp(x_adv, x, epsilon, margin=1e-6):
     tmp = x + (epsilon - margin)
@@ -41,14 +43,24 @@ def clamp(x_adv, x, epsilon, margin=1e-6):
     x_adv = torch.where(x_adv < tmp, tmp, x_adv)
     return x_adv
 
+
 @torch.no_grad()
 def zero_one_clamp(x, mean=0, std=1, margin=1e-6):
     x = torch.clamp(
         x * std + mean,
         min=margin,
-        max=1-margin
+        max=1 - margin
     )
     return (x - mean) / std
+
+
+def ensemble_logits(logits):
+    """ expects list of unnormalized logits """
+    N = len(logits)
+    log_probs = [logit.log_softmax(-1) for logit in logits]
+    avg_probs = torch.logsumexp(torch.stack(log_probs, dim=0), dim=0) - math.log(N)
+    return avg_probs
+
 
 class TIFGSM2(TIFGSM):
     def __init__(
@@ -115,16 +127,15 @@ class TIFGSM2(TIFGSM):
                                            retain_graph=False, create_graph=False)[0]
             # depth wise conv2d
             grad = F.conv2d(grad, stacked_kernel, stride=1, padding='same', groups=3)
-            grad = grad / torch.mean(torch.abs(grad), dim=(1,2,3), keepdim=True)
-            grad = grad + momentum*self.decay
+            grad = grad / torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True)
+            grad = grad + momentum * self.decay
             momentum = grad
 
-            adv_images = adv_images.detach() + self.alpha*grad.sign()
+            adv_images = adv_images.detach() + self.alpha * grad.sign()
             adv_images = clamp(adv_images, images, self.eps)
             adv_images = zero_one_clamp(adv_images, self.mean, self.std)
 
         return adv_images
-
 
 
 class AdvDataset(Dataset):
@@ -146,12 +157,15 @@ class AdvDataset(Dataset):
             self.labels += [int(cls)]
             self.names += [basename]
         self.transform = transform
+
     def __getitem__(self, idx):
         image = self.transform(Image.open(self.images[idx]))
         label = self.labels[idx]
         return image, label
+
     def __getname__(self):
         return self.names
+
     def __len__(self):
         return len(self.images)
 
@@ -175,8 +189,8 @@ class Attacker:
         self.mean = torch.tensor(self.cifar_100_mean).to(self.device).view(1, 3, 1, 1)
         self.std = torch.tensor(self.cifar_100_std).to(self.device).view(1, 3, 1, 1)
 
-        self.epsilon = args.epsilon_pixels/self.std/255.
-        self.alpha = 0.8/self.std/255.
+        self.epsilon = args.epsilon_pixels / self.std / 255.
+        self.alpha = 0.8 / self.std / 255.
 
         self.adv_set = AdvDataset(
             args.datadir,
@@ -185,7 +199,7 @@ class Attacker:
                 transforms.Normalize(self.cifar_100_mean, self.cifar_100_std)
             ]),
         )
-        
+
         self.adv_names = self.adv_set.__getname__()
         self.adv_loader = DataLoader(self.adv_set, batch_size=self.batch_size, shuffle=False)
 
@@ -210,33 +224,35 @@ class Attacker:
                 train_loss += loss.item() * x.shape[0]
         return train_acc / len(loader.dataset), train_loss / len(loader.dataset)
 
-    def gen_adv_examples(self, model, attack, victim=None):
-        victim = victim if victim is not None else model
+    def gen_adv_examples(self, models, attack, victim=None):
+        victim = victim if victim is not None else models[-1]
         device = self.device
-        model.eval()
+        for model in models:
+            model.eval()
         victim.eval()
-        adv_names = []
+        adv_examples = None
         n_data = len(self.adv_loader.dataset)
         train_acc, train_loss = 0.0, 0.0
         for i, (x, y) in enumerate(self.adv_loader):
             cuclear()
             x, y = x.to(device), y.to(device)
-            x_adv = attack(model, x, y, self.loss_fn) # obtain adversarial examples
+            x_adv = attack(models, x, y, self.loss_fn)  # obtain adversarial examples
             with torch.no_grad():
                 error = (x_adv - x).abs()
                 if (error > self.epsilon).any():
-                    import pdb; pdb.set_trace()
-                
+                    import pdb
+                    pdb.set_trace()
+
                 assert (error <= self.epsilon).all(), f"allowed: {self.epsilon.squeeze().tolist()}, got max: {error.max()} avg: {error.mean()}"
                 yp = victim(x_adv)
                 loss = self.loss_fn(yp, y)
                 train_acc += (yp.argmax(dim=1) == y).sum().item()
                 train_loss += loss.item() * x.shape[0]
                 # store adversarial examples
-                adv_ex = ((x_adv) * self.std + self.mean).clamp(0, 1) # to 0-1 scale
-                adv_ex = (adv_ex * 255).clamp(0, 255) # 0-255 scale
-                adv_ex = adv_ex.detach().cpu().data.numpy().round() # round to remove decimal part
-                adv_ex = adv_ex.transpose((0, 2, 3, 1)) # transpose (bs, C, H, W) back to (bs, H, W, C)
+                adv_ex = ((x_adv) * self.std + self.mean).clamp(0, 1)  # to 0-1 scale
+                adv_ex = (adv_ex * 255).clamp(0, 255)  # 0-255 scale
+                adv_ex = adv_ex.detach().cpu().data.numpy().round()  # round to remove decimal part
+                adv_ex = adv_ex.transpose((0, 2, 3, 1))  # transpose (bs, C, H, W) back to (bs, H, W, C)
                 adv_examples = adv_ex if i == 0 else np.r_[adv_examples, adv_ex]
         return adv_examples, train_acc / n_data, train_loss / n_data
 
@@ -245,7 +261,7 @@ class Attacker:
         if os.path.exists(adv_dir) is not True:
             _ = shutil.copytree(data_dir, adv_dir)
         for example, name in zip(adv_examples, self.adv_names):
-            im = Image.fromarray(example.astype(np.uint8)) # image pixel value should be unsigned int
+            im = Image.fromarray(example.astype(np.uint8))  # image pixel value should be unsigned int
             im.save(os.path.join(adv_dir, name))
 
     def build_model(self, name):
@@ -261,14 +277,22 @@ class Attacker:
         model = model.to(self.device)
         return model
 
-    def solve(self,):        
-        model = self.build_model(self.args.model)
+    def solve(self,):
+        models = []
+        for modelname in self.args.model.split(","):
+            models.append(self.build_model(modelname))
+        linbp_layers = []
+        if self.args.linbp_layer is not None:
+            linbp_layers = self.args.linbp_layer.split(",")
+            assert len(models) == len(linbp_layers)
+
         victim = None
         if self.args.victim != self.args.model:
             victim = self.build_model(self.args.victim)
 
-        benign_acc, benign_loss = self.epoch_benign(model)
-        logger.info(f'source benign_acc = {benign_acc:.5f}, benign_loss = {benign_loss:.5f}')
+        # for model in models:
+        #     benign_acc, benign_loss = self.epoch_benign(model)
+        #     logger.info(f'source benign_acc = {benign_acc:.5f}, benign_loss = {benign_loss:.5f}')
 
         if victim is not None:
             benign_acc, benign_loss = self.epoch_benign(victim)
@@ -277,7 +301,8 @@ class Attacker:
         if self.args.attack == "none":
             return
 
-        logger.info("source: {}".format(model.__class__.__name__))
+        for model in models:
+            logger.info("source: {}".format(model.__class__.__name__))
         if victim is not None:
             logger.info("victim: {}".format(victim.__class__.__name__))
         logger.info("attack: {}".format(self.args.attack))
@@ -297,7 +322,7 @@ class Attacker:
             return ifgsm(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.epsilon, num_iter=1)
 
         def input_diversity(x, resize_rate=1.25, diversity_prob=0.5):
-            mode = 'nearest' # 'bilinear'
+            mode = 'nearest'  # 'bilinear'
             img_size = x.shape[-1]
             img_resize = int(img_size * resize_rate)
 
@@ -306,27 +331,37 @@ class Attacker:
                 img_resize = x.shape[-1]
 
             rnd = torch.randint(low=img_size, high=img_resize, size=(1,), dtype=torch.int32)
-            rescaled = F.interpolate(x, size=[rnd, rnd], mode=mode) #, align_corners=False)
+            rescaled = F.interpolate(x, size=[rnd, rnd], mode=mode)  # , align_corners=False)
             h_rem = img_resize - rnd
             w_rem = img_resize - rnd
-            pad_top = torch.randint(low=0, high=h_rem.item()+1, size=(1,), dtype=torch.int32)
+            pad_top = torch.randint(low=0, high=h_rem.item() + 1, size=(1,), dtype=torch.int32)
             pad_bottom = h_rem - pad_top
-            pad_left = torch.randint(low=0, high=w_rem.item()+1, size=(1,), dtype=torch.int32)
+            pad_left = torch.randint(low=0, high=w_rem.item() + 1, size=(1,), dtype=torch.int32)
             pad_right = w_rem - pad_left
 
             padded = F.pad(rescaled, [pad_left.item(), pad_right.item(), pad_top.item(), pad_bottom.item()], value=0)
             padded = F.interpolate(padded, (img_size, img_size), mode=mode)
             return padded if torch.rand(1) < diversity_prob else x
 
-
-        def linbp(model, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=self.args.num_iter, linbp_layer=self.args.linbp_layer, sgm_lambda=self.args.sgm_lambda):
+        def linbp(models, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=self.args.num_iter, linbp_layers=linbp_layers, sgm_lambda=self.args.sgm_lambda):
             x_adv = x.detach().clone()
             for i in range(num_iter):
+                grad = 0
                 x_adv.requires_grad = True
-                att_out, ori_mask_ls, conv_out_ls, relu_out_ls, conv_input_ls = linbp_forw_resnet50(model, x_adv, True, linbp_layer)
-                loss = loss_fn(att_out, y)
-                model.zero_grad()
-                grad = linbp_backw_resnet50(x_adv, loss, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=sgm_lambda)
+                logits = []
+                forw_outs = []
+                assert len(models) == len(linbp_layers)
+                for model, linbp_layer in zip(models, linbp_layers):
+                    att_out, ori_mask_ls, conv_out_ls, relu_out_ls, conv_input_ls = linbp_forw_resnet50(model, x_adv, True, linbp_layer)
+                    forw_outs.append((conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls))
+                    logits.append(att_out)
+                    model.zero_grad()
+
+                loss = loss_fn(ensemble_logits(logits), y)
+                for model, outs in zip(models, forw_outs):
+                    conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls = outs
+                    grad += linbp_backw_resnet50(x_adv, loss, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=sgm_lambda)
+
                 x_adv = x_adv.data + alpha * grad.sign()
                 x_adv = clamp(x_adv, x, epsilon)
             return x_adv
@@ -338,7 +373,7 @@ class Attacker:
             logger.info("num iters: {}".format(self.args.num_iter))
         elif self.args.attack == "linbp":
             atk_fn = linbp
-            assert self.args.linbp_layer != None
+            assert self.args.linbp_layer is not None
             logger.info("num iters: {}".format(self.args.num_iter))
             logger.info("linear BP layer start: {}".format(self.args.linbp_layer))
             logger.info("SGM factor: {}".format(self.args.sgm_lambda))
@@ -351,14 +386,14 @@ class Attacker:
                 "resize_rate": self.args.resize_rate,
                 "diversity_prob": self.args.diversity_prob,
                 "random_start": self.args.random_start,  # pgd
-                "linbp_layer":self.args.linbp_layer,
-                "sgm_lambda":self.args.sgm_lambda,
+                "linbp_layer": self.args.linbp_layer,
+                "sgm_lambda": self.args.sgm_lambda,
             }
             atk_fn = TIFGSM2(
                 model,
-                eps=self.epsilon, 
-                alpha=self.alpha, 
-                steps=self.args.num_iter, 
+                eps=self.epsilon,
+                alpha=self.alpha,
+                steps=self.args.num_iter,
                 mean=self.mean,
                 std=self.std,
                 **cfg
@@ -369,8 +404,7 @@ class Attacker:
         else:
             raise NotImplementedError(f"{self.args.attack} attack not implemented")
 
-
-        adv_examples, acc, loss = self.gen_adv_examples(model, atk_fn, victim)
+        adv_examples, acc, loss = self.gen_adv_examples(models, atk_fn, victim)
         logger.info(f'attack {self.args.attack}_acc = {acc:.5f}, {self.args.attack}_loss = {loss:.5f}')
 
         if self.args.savedir is not None:
@@ -404,12 +438,12 @@ if __name__ == "__main__":
         "none", "fgsm", "ifgsm", "linbp", "tifgsm"
     ])
     parser.add_argument("--iters", type=int, dest="num_iter", default=1)
-    parser.add_argument("--linbp-layer", default=None) #"3_4")
-    parser.add_argument("--sgm-lambda",  type=float, default=0.5)
+    parser.add_argument("--linbp-layer", default=None)
+    parser.add_argument("--sgm-lambda", type=float, default=0.5)
 
     parser.add_argument("--decay", type=float, default=0.0)
-    parser.add_argument("--kernel-name",  choices=['gaussian', 'uniform', 'linear'], default='gaussian')
-    parser.add_argument("--len-kernel",  type=int, default=5)
+    parser.add_argument("--kernel-name", choices=['gaussian', 'uniform', 'linear'], default='gaussian')
+    parser.add_argument("--len-kernel", type=int, default=5)
     parser.add_argument("--nsig", type=int, default=3)
     parser.add_argument("--resize-rate", type=float, default=1.25)
     parser.add_argument("--diversity-prob", type=float, default=0.6)
