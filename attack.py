@@ -63,20 +63,18 @@ class TIFGSM2(TIFGSM):
         mean=None,
         std=None,
         margin=1e-6,
-        linbp_layer='2_8',
+        linbp_layers=None,
         sgm_lambda=0.5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.linbp_layer = linbp_layer
+        self.linbp_layers = linbp_layers if len(linbp_layers)>0 else None
         self.sgm_lambda = sgm_lambda
         self.mean = mean
         self.std = std
         self.margin = margin
-        self.linbp_layer = linbp_layer
-        self.sgm_lambda = sgm_lambda
 
-    def forward(self, model, x, y, loss_fn):
+    def forward(self, models, x, y, loss_fn):
         r"""
         Overridden.
         """
@@ -99,25 +97,37 @@ class TIFGSM2(TIFGSM):
 
         for _ in range(self.steps):
             adv_images.requires_grad = True
+            if adv_images.grad is not None:
+                adv_images.grad.zero_()
             # outputs = self.model(self.input_diversity(adv_images))
-            if self.linbp_layer is not None:
-                outputs, ori_mask_ls, conv_out_ls, relu_out_ls, conv_input_ls = linbp_forw_resnet50(
-                    model, self.input_diversity(adv_images), True, self.linbp_layer)
+            forw_outs = []
+            logits = []
+
+            if self.linbp_layers is not None:
+                for model, linbp_layer in zip(models, self.linbp_layers):
+                    att_out, ori_mask_ls, conv_out_ls, relu_out_ls, conv_input_ls = linbp_forw_resnet50(model, self.input_diversity(adv_images), True, linbp_layer)
+                    forw_outs.append((conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls))
+                    logits.append(att_out)
+                    model.zero_grad()
             else:
-                outputs = model(self.input_diversity(adv_images))
+                for model in models:
+                    logits.append(model(self.input_diversity(adv_images)))
+                    model.zero_grad()
 
             # Calculate loss
             if self._targeted:
-                cost = -loss_fn(outputs, target_labels)
+                cost = -loss_fn(ensemble_logits(logits), target_labels)
             else:
-                cost = loss_fn(outputs, labels)
+                cost = loss_fn(ensemble_logits(logits), labels)
 
             # Update adversarial images
-            if self.linbp_layer is not None:
-                grad = linbp_backw_resnet50(
-                    adv_images, cost, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=self.sgm_lambda)
+            grad = 0.0
+            if self.linbp_layers is not None:                
+                for model, outs in zip(models, forw_outs):
+                    conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls = outs
+                    grad += linbp_backw_resnet50(adv_images, cost, conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls, xp=self.sgm_lambda)
             else:
-                grad = torch.autograd.grad(cost, adv_images,
+                grad += torch.autograd.grad(cost, adv_images,
                                            retain_graph=False, create_graph=False)[0]
             # depth wise conv2d
             grad = F.conv2d(grad, stacked_kernel, stride=1, padding='same', groups=3)
@@ -308,9 +318,12 @@ class Attacker:
                 x_adv.requires_grad = True
                 if x_adv.grad is not None:
                     x_adv.grad.zero_()
+                logits = []
                 for model in models:
-                    loss = loss_fn(model(x_adv), y)
-                    loss.backward(retain_graph=True)
+                    logits.append(model(x_adv))
+                loss = loss_fn(ensemble_logits(logits), y)
+                loss.backward()
+                # loss.backward(retain_graph=True)
                 grad = x_adv.grad.detach()
                 x_adv = x_adv + epsilon * grad.sign()
                 x_adv = clamp(x_adv, x, epsilon)
@@ -384,11 +397,11 @@ class Attacker:
                 "resize_rate": self.args.resize_rate,
                 "diversity_prob": self.args.diversity_prob,
                 "random_start": self.args.random_start,  # pgd
-                "linbp_layer": self.args.linbp_layer,
+                "linbp_layers": linbp_layers,
                 "sgm_lambda": self.args.sgm_lambda,
             }
             atk_fn = TIFGSM2(
-                model,
+                models[0],
                 eps=self.epsilon,
                 alpha=self.alpha,
                 steps=self.args.num_iter,
