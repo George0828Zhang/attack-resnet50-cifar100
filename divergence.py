@@ -76,20 +76,22 @@ class Calculator(Attacker):
                 assert 0 <= cls <= 99
                 logits[cls] = val
                 # print(logits.sum())
-
-            remainder = (1. - logits.sum()) / (logits == 0).sum()
-            data[img] = torch.where(logits > 0, logits, remainder)
-            assert torch.isclose(data[img].sum(), torch.ones((1,)))
+            if self.args.logit:
+                data[img] = logits
+            else:
+                remainder = (1. - logits.sum()) / (logits == 0).sum()
+                data[img] = torch.where(logits > 0, logits, remainder)
+                assert torch.isclose(data[img].sum(), torch.ones((1,)))
 
         ordered_data = []
         for im in self.adv_set.images:
             ordered_data.append(data[PurePath(im).name])
         ordered_data = torch.stack(ordered_data, 0)  # N, 100
 
-        res = [int(n.split('_')[0]) == int(p.split('-')[0]) for n, p in zip(df["name"], df["top1 class"])]
-        logger.info(f"top-1: {sum(res) / len(res)}")
+        # res = [int(n.split('_')[0]) == int(p.split('-')[0]) for n, p in zip(df["name"], df["top1 class"])]
+        # logger.info(f"top-1: {sum(res) / len(res)}")
 
-        return ordered_data.log()
+        return ordered_data.log_softmax(-1) if self.args.logit else ordered_data.log()
 
     @torch.no_grad()
     def calc_kl_div(self, model):
@@ -102,14 +104,14 @@ class Calculator(Attacker):
             x, z = x.to(device), z.to(device)
             lprob = model(x).log_softmax(-1)
             kl_div += F.kl_div(
-                z,
                 lprob,
+                z,
                 reduction='sum',
                 log_target=True
             ).item()
             rev_kl_div += F.kl_div(
-                lprob,
                 z,
+                lprob,
                 reduction='sum',
                 log_target=True
             ).item()
@@ -130,6 +132,7 @@ class Calculator(Attacker):
         super(Calculator, Calculator).add_args(parser)
         parser.add_argument("--csv-path", default="./benign_result.csv")
         parser.add_argument("--result-path", default="./kld_result.csv")
+        parser.add_argument("--logit", action="store_true")
 
 
 if __name__ == "__main__":

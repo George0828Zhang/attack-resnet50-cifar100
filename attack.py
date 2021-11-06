@@ -99,19 +99,20 @@ class TIFGSM2(TIFGSM):
             adv_images.requires_grad = True
             if adv_images.grad is not None:
                 adv_images.grad.zero_()
+            adv_images = self.input_diversity(adv_images)
             # outputs = self.model(self.input_diversity(adv_images))
             forw_outs = []
             logits = []
 
             if self.linbp_layers is not None:
                 for model, linbp_layer in zip(models, self.linbp_layers):
-                    att_out, ori_mask_ls, conv_out_ls, relu_out_ls, conv_input_ls = linbp_forw_resnet50(model, self.input_diversity(adv_images), True, linbp_layer)
+                    att_out, ori_mask_ls, conv_out_ls, relu_out_ls, conv_input_ls = linbp_forw_resnet50(model, adv_images, True, linbp_layer)
                     forw_outs.append((conv_out_ls, ori_mask_ls, relu_out_ls, conv_input_ls))
                     logits.append(att_out)
                     model.zero_grad()
             else:
                 for model in models:
-                    logits.append(model(self.input_diversity(adv_images)))
+                    logits.append(model(adv_images))
                     model.zero_grad()
 
             # Calculate loss
@@ -140,6 +141,28 @@ class TIFGSM2(TIFGSM):
             adv_images = zero_one_clamp(adv_images, self.mean, self.std)
 
         return adv_images
+
+    def input_diversity(self, x):
+        mode = 'nearest'  # 'bilinear'
+        img_size = x.shape[-1]
+        img_resize = int(img_size * self.resize_rate)
+
+        if self.resize_rate < 1:
+            img_size = img_resize
+            img_resize = x.shape[-1]
+
+        rnd = torch.randint(low=img_size, high=img_resize, size=(1,), dtype=torch.int32)
+        rescaled = F.interpolate(x, size=[rnd, rnd], mode=mode)  # , align_corners=False)
+        h_rem = img_resize - rnd
+        w_rem = img_resize - rnd
+        pad_top = torch.randint(low=0, high=h_rem.item() + 1, size=(1,), dtype=torch.int32)
+        pad_bottom = h_rem - pad_top
+        pad_left = torch.randint(low=0, high=w_rem.item() + 1, size=(1,), dtype=torch.int32)
+        pad_right = w_rem - pad_left
+
+        padded = F.pad(rescaled, [pad_left.item(), pad_right.item(), pad_top.item(), pad_bottom.item()], value=0)
+        padded = F.interpolate(padded, (img_size, img_size), mode=mode)
+        return padded if torch.rand(1) < self.diversity_prob else x
 
 
 class AdvDataset(Dataset):
@@ -331,28 +354,6 @@ class Attacker:
 
         def fgsm(models, x, y, loss_fn, epsilon=self.epsilon):
             return ifgsm(models, x, y, loss_fn, epsilon=self.epsilon, alpha=self.epsilon, num_iter=1)
-
-        def input_diversity(x, resize_rate=1.25, diversity_prob=0.5):
-            mode = 'nearest'  # 'bilinear'
-            img_size = x.shape[-1]
-            img_resize = int(img_size * resize_rate)
-
-            if resize_rate < 1:
-                img_size = img_resize
-                img_resize = x.shape[-1]
-
-            rnd = torch.randint(low=img_size, high=img_resize, size=(1,), dtype=torch.int32)
-            rescaled = F.interpolate(x, size=[rnd, rnd], mode=mode)  # , align_corners=False)
-            h_rem = img_resize - rnd
-            w_rem = img_resize - rnd
-            pad_top = torch.randint(low=0, high=h_rem.item() + 1, size=(1,), dtype=torch.int32)
-            pad_bottom = h_rem - pad_top
-            pad_left = torch.randint(low=0, high=w_rem.item() + 1, size=(1,), dtype=torch.int32)
-            pad_right = w_rem - pad_left
-
-            padded = F.pad(rescaled, [pad_left.item(), pad_right.item(), pad_top.item(), pad_bottom.item()], value=0)
-            padded = F.interpolate(padded, (img_size, img_size), mode=mode)
-            return padded if torch.rand(1) < diversity_prob else x
 
         def linbp(models, x, y, loss_fn, epsilon=self.epsilon, alpha=self.alpha, num_iter=self.args.num_iter, linbp_layers=linbp_layers, sgm_lambda=self.args.sgm_lambda):
             x_adv = x.detach().clone()
