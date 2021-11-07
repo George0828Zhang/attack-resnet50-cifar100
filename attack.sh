@@ -62,20 +62,47 @@ elif [[ $EXP == "5" ]]; then
         --iters 30 \
         --diversity-prob 0 \
         --model nin_cifar100`
+                `,shakeshakeresnet20_2x16d_cifar100`
                 `,xdensenet40_2_k24_bc_cifar100`
+                `,resnet110_cifar100`
                 `,diaresnet56_cifar100`
                 `,ror3_56_cifar100`
                 `,diapreresnet56_cifar100`
+                `,wrn40_8_cifar100`
                 `,preresnet56_cifar100`
+                `,xdensenet40_2_k36_bc_cifar100`
                 `,seresnet56_cifar100`
                 `,wrn28_10_cifar100`
+                `,diapreresnet110_cifar100`
+                `,ror3_110_cifar100`
+                `,preresnet110_cifar100 \
+        --savedir $res
+elif [[ $EXP == "6" ]]; then
+    echo "TIFGSM ensemble (20)."
+    res=tifgsm_ensemble20
+    python attack.py --attack tifgsm \
+        --iters 30 \
+        --diversity-prob 0 \
+        --model nin_cifar100`
+                `,shakeshakeresnet20_2x16d_cifar100`
+                `,xdensenet40_2_k24_bc_cifar100`
+                `,resnet110_cifar100`
+                `,diaresnet56_cifar100`
+                `,ror3_56_cifar100`
+                `,diapreresnet56_cifar100`
+                `,wrn40_8_cifar100`
+                `,preresnet56_cifar100`
+                `,xdensenet40_2_k36_bc_cifar100`
+                `,seresnet56_cifar100`
+                `,wrn28_10_cifar100`
+                `,diapreresnet110_cifar100`
+                `,ror3_110_cifar100`
+                `,preresnet110_cifar100`
                 `,sepreresnet56_cifar100`
-                `,shakeshakeresnet26_2x32d_cifar100`
-                `,resnet164bn_cifar100`
-                `,cifar100_resnet20`
-                `,cifar100_shufflenetv2_x0_5`
-                `,rir_cifar100`
-                `,resnext29_32x4d_cifar100 \
+                `,seresnet110_cifar100`
+                `,sepreresnet110_cifar100`
+                `,sepreresnet164bn_cifar100`
+                `,shakeshakeresnet26_2x32d_cifar100 \
         --savedir $res
 fi
 compress $res

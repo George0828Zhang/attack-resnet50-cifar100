@@ -70,34 +70,38 @@ python score.py benign_result.csv
 bash select_models.sh
 # see attack.sh for selection.
 ```
-4. Use Translation Invariant attack (TIFGSM) with ensemble of the 15 models selected above:
+4. Use Translation Invariant attack (TIFGSM) with ensemble of the 20 models selected above:
 ```bash
-res=tifgsm_ensemble15
+res=tifgsm_ensemble20
 python attack.py --attack tifgsm \
     --iters 30 \
     --diversity-prob 0 \
     --model nin_cifar100`
-            `,xdensenet40_2_k24_bc_cifar100`
-            `,diaresnet56_cifar100`
-            `,ror3_56_cifar100`
-            `,diapreresnet56_cifar100`
-            `,preresnet56_cifar100`
-            `,seresnet56_cifar100`
-            `,wrn28_10_cifar100`
-            `,sepreresnet56_cifar100`
-            `,shakeshakeresnet26_2x32d_cifar100`
-            `,resnet164bn_cifar100`
-            `,cifar100_resnet20`
-            `,cifar100_shufflenetv2_x0_5`
-            `,rir_cifar100`
-            `,resnext29_32x4d_cifar100 \
+        `,shakeshakeresnet20_2x16d_cifar100`
+        `,xdensenet40_2_k24_bc_cifar100`
+        `,resnet110_cifar100`
+        `,diaresnet56_cifar100`
+        `,ror3_56_cifar100`
+        `,diapreresnet56_cifar100`
+        `,wrn40_8_cifar100`
+        `,preresnet56_cifar100`
+        `,xdensenet40_2_k36_bc_cifar100`
+        `,seresnet56_cifar100`
+        `,wrn28_10_cifar100`
+        `,diapreresnet110_cifar100`
+        `,ror3_110_cifar100`
+        `,preresnet110_cifar100`
+        `,sepreresnet56_cifar100`
+        `,seresnet110_cifar100`
+        `,sepreresnet110_cifar100`
+        `,sepreresnet164bn_cifar100`
+        `,shakeshakeresnet26_2x32d_cifar100 \
     --savedir $res
-zip -r $res.zip $res
 ```
 5. Compute accuracy.
 ```bash
 python score.py tifgsm_ensemble15.csv
-# 2021-11-06 01:39:45 | INFO | root | top-1: 0.172
+# 2021-11-08 04:55:30 | INFO | root | top-1: 0.134
 ```
 6. See `attack.sh` for other options presented in report.
 
